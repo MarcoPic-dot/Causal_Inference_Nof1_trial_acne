@@ -1,0 +1,203 @@
+
+library(betareg)
+library(tidyverse)
+
+dat_o <- read_csv(file.choose())
+
+G <- 500
+B <- 500
+
+# Data Management
+
+# rename variables and drop unnecessary columns
+dat <- dat_o %>% rename(time="Timestamp (From Photo)(MMDD-YYYY-HHMMSS)",
+                        id="Id",
+                        image_id="Image Id(Id-Timestamp)",
+                        temperature="Temperature (°F)",
+                        activity="Activity Level (Categorical), i.e none, light, intense",
+                        lotion="Applied Lotion/Makeup\r\n(Boolean)",
+                        treatment="Intervention\r\n(Boolean)") %>% select(-"Unnamed: 7")
+
+# create outcome as average of scaled scores
+dat <- mutate(dat, outcome = rowMeans(select(dat, starts_with("scores_"))))
+
+# drop individual scores
+dat <- dat %>% select(-starts_with("scores_"))
+
+# fix wrong timestamp for 2 data points: if timestamp does not match image file name, assign time in the image file name as timestamp
+dat$time <- ifelse(dat$time!=substr(dat$image_id,3,18), substr(dat$image_id,3,18), dat$time)
+
+# convert time in R format
+dat$time <- lubridate::mdy_hms(dat$time)
+
+# if activity is "False" it means "None"
+dat$activity <- ifelse(dat$activity=="False", "None", dat$activity)
+
+# number of measurement by participant
+dat <- dat %>% arrange(id,time) %>% group_by(id) %>% mutate(time_discrete=1:n()) %>% ungroup()
+
+dat$day_moment <- ifelse(dat$time_discrete %in% seq(1,60,by=3),"wakeup", 
+                         ifelse(dat$time_discrete %in% seq(2,60,by=3),"sec_meal","bedtime")) 
+
+# filter only participants of interest
+dat <- dat %>% filter(id==1 | id==2)
+
+# Visualize Data for participants 1 and 2
+p <- ggplot(dat, aes(x=time_discrete, y=outcome, col=treatment, group=id, shape=day_moment)) + geom_point(size=3) + geom_line() +
+  geom_point(data=dat,aes(x=time_discrete, y=-0.05, group=id, fill=temperature), shape=22, size=5, inherit.aes = FALSE)  +
+  scale_fill_gradient("Temperature (°F)",low="blue", high="white") + 
+  scale_color_manual("Treatment", values=c("#F8766D","#619CFF"))  + 
+  scale_shape_manual("Moment of the day", values = c(15,16,17), labels = c("Bedtime", "Second meal", "Wake up")) +
+  ylim(-0.05,1) + ylab("Outcome") + xlab("Time points") + facet_grid(vars(id))
+
+p
+
+# Select participant of interest (1 or 2)
+dat_i <- dat %>% filter(id==1)
+
+
+# Investigation 1
+
+## Test for strong conditional stationarity of the counterfactuals
+betareg(outcome ~ time_discrete, data = dat_i %>% filter(treatment==TRUE)) %>% summary()
+betareg(outcome ~ time_discrete, data = dat_i %>% filter(treatment==FALSE)) %>% summary()
+
+## Estimate U-CATE under basic causal model
+y_a1_i <- dat_i[dat_i$treatment==TRUE,"outcome"] %>% pull()
+y_a0_i <- dat_i[dat_i$treatment==FALSE,"outcome"] %>% pull() 
+nt1 <- length(y_a1_i)
+nt0 <- length(y_a0_i)
+se <- sqrt(var(y_a1_i)/nt1 + var(y_a0_i)/nt0)
+
+# mean difference
+tau_i <- mean(y_a1_i) - mean(y_a0_i)
+tau_i
+
+# 95%CI
+c( tau_i - qnorm(1-0.05/2)*se, tau_i - qnorm(0.05/2)*se )
+
+
+# Investigation 2
+
+## Test for specific effect under possible carryover
+se <- sqrt( var(c(y_a1_i, y_a0_i)) * (1/nt1+1/nt0) )
+c( tau_i - qnorm(1-0.05/2)*se, tau_i - qnorm(0.05/2)*se )
+
+
+# Investigation 3
+
+## Estimate average U-CATE (repetitive L)
+sum_var <- dat_i %>% group_by(treatment, day_moment) %>% summarise(var_wx=var(outcome)) %>% ungroup() %>%  summarise(temp=sum(var_wx)) %>% pull()
+se <- sqrt( sum_var*2/((nt1+nt0)*length(unique(dat_i$day_moment))) )
+
+tau_i
+# 95%CI
+c( tau_i - qnorm(1-0.05/2)*se, tau_i - qnorm(0.05/2)*se )
+
+rm(y_a1_i, y_a0_i, nt1, nt0, tau_i, sum_var, se)
+
+
+# Investigation 4
+
+set.seed(12345)
+
+## Point estimate
+# function to initialize a dataset to be filled with counterfactuals (using dat_train as structure)
+initialize_counterfactual_dataset <- function(treatment_strategy) {
+  temp_d <- dat_train %>% mutate_at(.vars=vars(lag1_day_moment,lag1_temperature,lag1_treatment,lag1_outcome,day_moment,temperature,treatment,outcome), .funs=function(x) x=NA)
+  temp_d$treatment <- treatment_strategy
+  ## fix first time point
+  temp_d[2,c("lag1_day_moment", "lag1_temperature", "lag1_treatment", "lag1_outcome")] <- temp_d[1,c("day_moment", "temperature", "treatment", "outcome")] <- dat_train[1,c("day_moment", "temperature", "treatment", "outcome")]
+  return(temp_d)
+}
+
+# function to fill the dataset with counterfactuals based on the beta and linear model
+fill_counterfactual_dataset <- function(temp_d, mod_out, mod_temp) {
+  for (i in 2:nrow(temp_d)) {
+    temp_d[i,"day_moment"] <- ifelse(pull(temp_d[i,"lag1_day_moment"])=="bedtime", "wakeup", ifelse(pull(temp_d[i,"lag1_day_moment"])=="wakeup", "sec_meal", "bedtime"))
+    if (pull(temp_d[i,"lag1_day_moment"])=="bedtime") {temp_d[i, "temperature"] <- rnorm(1, mean=predict(mod_temp, newdata=temp_d[i,]), sd=summary(mod_temp)$sigma)}
+    if (pull(temp_d[i,"lag1_day_moment"])!="bedtime") {temp_d[i, "temperature"] <- temp_d[i, "lag1_temperature"]}
+    shape1 <- predict(mod_out, newdata=temp_d[i,], type="response")*as.numeric(mod_out$coefficients$precision)
+    shape2 <- as.numeric(mod_out$coefficients$precision) - shape1
+    temp_d[i, "outcome"] <- rbeta(1, shape1=shape1, shape2=shape2)
+    
+    if (i+1 <= nrow(temp_d)) {temp_d[i+1,c("lag1_treatment","lag1_day_moment", "lag1_temperature", "lag1_outcome")] <- temp_d[i,c("treatment","day_moment","temperature","outcome")]}
+    rm(shape1, shape2)
+  }
+  return(temp_d)
+}
+
+# training data with relevant variables (also lagged)
+dat_train <- dat_i %>% select(id, time_discrete, day_moment, temperature, treatment, outcome)
+dat_train <- bind_cols(dat_train %>% add_row(.before=1) %>% filter(row_number() < n()) %>% setNames(paste0('lag1_', names(.))), dat_train)
+
+# beta regression to predict the outcome
+model_outcome_o <- betareg(outcome ~ treatment + temperature + day_moment + lag1_treatment + lag1_outcome, data=dat_train)
+
+# linear regression to predict the covariate temperature from one day to the next
+model_temperature_o <- lm(temperature ~ lag1_temperature, data=dat_train %>% filter(day_moment=="wakeup"))
+
+point_effect <- matrix(NA_real_, nrow = G, ncol = nrow(dat_train))
+
+for (g in 1:G) {
+  # obtain outcome under "never treatment" strategy
+  dat_counterfactual <- initialize_counterfactual_dataset(treatment_strategy = FALSE)
+  dat_counterfactual <- fill_counterfactual_dataset(dat_counterfactual, model_outcome_o, model_temperature_o)
+  theta_0 <- dat_counterfactual$outcome
+  
+  # obtain outcome under "always treatment" strategy
+  dat_counterfactual <- initialize_counterfactual_dataset(treatment_strategy = TRUE)
+  dat_counterfactual <- fill_counterfactual_dataset(dat_counterfactual, model_outcome_o, model_temperature_o)
+  theta_1 <- dat_counterfactual$outcome
+  
+  # take difference of the outcomes between the two scenarios
+  point_effect[g,] <- theta_1-theta_0
+  rm(dat_counterfactual, theta_0, theta_1)
+}
+
+# take the mean across G repetitions, this is the point estimate
+point_effect_o <- apply(point_effect, MARGIN=2, FUN=mean)
+rm(point_effect)
+
+## Confidence interval via parametric bootstrap
+effect <- matrix(NA_real_, nrow = B, ncol = nrow(dat_train))
+
+for (b in 1:B) {
+  # generate data from the models fitted in the original sample under the assigned treatment schedule
+  dat_boot <- initialize_counterfactual_dataset(treatment_strategy = dat_train$treatment)
+  dat_boot <- fill_counterfactual_dataset(dat_boot, model_outcome_o, model_temperature_o)
+  
+  # repeat the procedure to estimate the point estimate in the bootstrapped sample
+  model_outcome <- betareg(outcome ~ treatment + temperature + day_moment + lag1_treatment + lag1_outcome, data=dat_boot)
+  model_temperature <- lm(temperature ~ lag1_temperature, data=dat_boot %>% filter(day_moment=="wakeup"))
+  
+  point_effect <- matrix(NA_real_, nrow = G, ncol = nrow(dat_train))
+  
+  for (g in 1:G) {
+    dat_counterfactual <- initialize_counterfactual_dataset(treatment_strategy = FALSE)
+    dat_counterfactual <- fill_counterfactual_dataset(dat_counterfactual, model_outcome, model_temperature)
+    theta_0 <- dat_counterfactual$outcome
+    
+    dat_counterfactual <- initialize_counterfactual_dataset(treatment_strategy = TRUE)
+    dat_counterfactual <- fill_counterfactual_dataset(dat_counterfactual, model_outcome, model_temperature)
+    theta_1 <- dat_counterfactual$outcome
+    
+    point_effect[g,] <- theta_1-theta_0
+    rm(dat_counterfactual, theta_0, theta_1)
+  }
+  
+  # save point estimate obtained in the bootstrapped sample
+  effect[b,] <- apply(point_effect, MARGIN=2, FUN=mean)
+  rm(model_outcome, model_temperature, point_effect)
+}
+
+# build 95% confidence intervals
+report <- data.frame(point=point_effect_o, std=apply(effect, MARGIN=2, FUN=sd))
+report$lower <- report$point -qnorm(1-0.05/2)*report$std
+report$upper <- report$point -qnorm(0.05/2)*report$std
+report$time_discrete <- 1:nrow(report)
+
+### Plot
+p <- ggplot(report %>% filter(time_discrete!=1), aes(x=time_discrete, y=point)) + geom_point() + geom_line() +
+  geom_ribbon(aes(ymin=lower,ymax=upper),alpha=0.3) + xlab("Time point") + ylab("Estimated individual-specific causal effect")
+p
